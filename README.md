@@ -32,19 +32,19 @@ EC2上の音声ファイルを逐次処理してタイムライン分析を実�
 #### リクエスト
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"user_id": "user123", "date": "2025-06-21"}' \
+  -d '{"device_id": "device123", "date": "2025-06-21"}' \
   "http://localhost:8004/analyze/sed/timeline-v2?threshold=0.2"
 ```
 
 #### パラメータ
-- `user_id` (必須): ユーザーID
+- `device_id` (必須): デバイスID
 - `date` (必須): 日付（YYYY-MM-DD形式）
 - `threshold` (オプション): 確信度の閾値（デフォルト: 0.2）
 
 #### レスポンス例
 ```json
 {
-  "user_id": "user123",
+  "device_id": "device123",
   "date": "2025-06-21",
   "total_processed_slots": 15,
   "total_available_slots": 48,
@@ -68,7 +68,7 @@ curl -X POST -H "Content-Type: application/json" \
 #### 処理フロー（完全自動化）
 1. **EC2ダウンロード**: `https://api.hey-watch.me/download` からWAVファイル取得
 2. **音声解析**: YamNetモデルでSound Event Detection実行
-3. **ローカル保存**: `/Users/kaya.matsumoto/data/data_accounts/{user_id}/{date}/sed/{slot}.json`
+3. **ローカル保存**: `/Users/kaya.matsumoto/data/data_accounts/{device_id}/{date}/sed/{slot}.json`
 4. **EC2アップロード**: `https://api.hey-watch.me/upload/analysis/sed-timeline` に結果をアップロード
 
 #### 特徴
@@ -90,10 +90,10 @@ curl -X POST -H "Content-Type: application/json" \
 - **Breathing, Snoring** (呼吸・いびき)
 
 #### 出力ファイル
-- **ローカル**: `/Users/kaya.matsumoto/data/data_accounts/{user_id}/{date}/sed/`
+- **ローカル**: `/Users/kaya.matsumoto/data/data_accounts/{device_id}/{date}/sed/`
   - `{slot}.json` - 各スロットの処理結果
   - `processing_summary.json` - 処理サマリー  
-- **EC2**: `/home/ubuntu/data/data_accounts/{user_id}/{date}/sed/{slot}.json`
+- **EC2**: `/home/ubuntu/data/data_accounts/{device_id}/{date}/sed/{slot}.json`
 
 ### 2. **タイムライン検出** - `/analyze/sed/timeline` (POST)
 
@@ -382,11 +382,11 @@ import streamlit as st
 import requests
 from datetime import datetime
 
-def call_sed_timeline_v2(user_id: str, date: str):
+def call_sed_timeline_v2(device_id: str, date: str):
     """行動グラフ用SED分析を実行"""
     
     url = "http://localhost:8004/analyze/sed/timeline-v2"
-    payload = {"user_id": user_id, "date": date}
+    payload = {"device_id": device_id, "date": date}
     
     try:
         with st.spinner("🎵 音声イベント分析中..."):
@@ -420,16 +420,16 @@ def call_sed_timeline_v2(user_id: str, date: str):
 st.title("🎵 WatchMe 行動グラフ - Sound Event Detection")
 
 with st.form("sed_form"):
-    user_id = st.text_input("ユーザーID", value="user123")
+    device_id = st.text_input("デバイスID", value="device123")
     date = st.date_input("分析対象日", value=datetime.now().date())
     
     submitted = st.form_submit_button("🚀 音声イベント分析実行")
     
     if submitted:
-        if user_id and date:
-            result = call_sed_timeline_v2(user_id, str(date))
+        if device_id and date:
+            result = call_sed_timeline_v2(device_id, str(date))
         else:
-            st.error("ユーザーIDと日付を入力してください")
+            st.error("デバイスIDと日付を入力してください")
 ```
 
 ## 注意事項
@@ -438,7 +438,7 @@ with st.form("sed_form"):
 - **処理時間**: ファイルサイズと長さに依存（スロットあたり10-20秒）
 - **メモリ使用量**: 大きなファイルでは一時的にメモリを多く消費
 - **同時接続**: 同時に複数のリクエストを処理可能
-- **安全な運用**: 同じユーザー・日付の同時処理は避ける（ファイル競合リスク）
+- **安全な運用**: 同じデバイス・日付の同時処理は避ける（ファイル競合リスク）
 
 ## ライセンス
 

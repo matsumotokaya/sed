@@ -206,13 +206,13 @@ def generate_time_slots():
             slots.append(slot)
     return slots
 
-def create_output_directory(user_id: str, date: str):
+def create_output_directory(device_id: str, date: str):
     """
     ローカル出力ディレクトリを作成する
-    例: /Users/kaya.matsumoto/data/data_accounts/user123/2025-06-18/sed/
+    例: /Users/kaya.matsumoto/data/data_accounts/device123/2025-06-18/sed/
     """
     base_path = Path("/Users/kaya.matsumoto/data/data_accounts")
-    output_dir = base_path / user_id / date / "sed"
+    output_dir = base_path / device_id / date / "sed"
     
     # ディレクトリを作成（親ディレクトリも含めて）
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -233,12 +233,12 @@ def save_slot_result(output_dir: Path, slot: str, timeline_data: dict):
     print(f"💾 保存完了: {output_file}")
     return output_file
 
-async def upload_sed_json_to_ec2(user_id: str, date: str, slot: str, json_file_path: Path):
+async def upload_sed_json_to_ec2(device_id: str, date: str, slot: str, json_file_path: Path):
     """
     ローカルのSED JSONファイルをEC2にアップロードする
     
     Args:
-        user_id: ユーザーID
+        device_id: デバイスID
         date: 日付（YYYY-MM-DD）
         slot: スロット（HH-MM）
         json_file_path: ローカルJSONファイルのパス
@@ -258,7 +258,7 @@ async def upload_sed_json_to_ec2(user_id: str, date: str, slot: str, json_file_p
             
             # FormDataを作成
             data = aiohttp.FormData()
-            data.add_field('user_id', user_id)
+            data.add_field('device_id', device_id)
             data.add_field('date', date)
             data.add_field('time_block', slot)  # EC2側で期待されるフィールド名に変更
             data.add_field('file', file_content, filename=f"{slot}.json", content_type='application/json')
@@ -279,13 +279,13 @@ async def upload_sed_json_to_ec2(user_id: str, date: str, slot: str, json_file_p
         print(f"❌ EC2アップロード中にエラー: {slot} - {str(e)}")
         return False
 
-async def download_audio_file(session: aiohttp.ClientSession, user_id: str, date: str, slot: str):
+async def download_audio_file(session: aiohttp.ClientSession, device_id: str, date: str, slot: str):
     """
     EC2サーバーから音声ファイルをダウンロードする
     """
     url = f"https://api.hey-watch.me/download"
     params = {
-        "user_id": user_id,
+        "device_id": device_id,
         "date": date,
         "slot": slot
     }
@@ -478,7 +478,7 @@ class SummaryResult(BaseModel):
 
 # timeline-v2用のモデル
 class TimelineV2Request(BaseModel):
-    user_id: str
+    device_id: str
     date: str  # YYYY-MM-DD形式
 
 class SlotTimelineData(BaseModel):
@@ -487,7 +487,7 @@ class SlotTimelineData(BaseModel):
     slot_timeline: List[TimeSlot]
 
 class TimelineV2Result(BaseModel):
-    user_id: str
+    device_id: str
     date: str
     total_processed_slots: int
     total_available_slots: int
@@ -761,7 +761,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
     Returns:
         各スロットのタイムライン分析結果
     """
-    print(f"🎯 timeline-v2 処理開始: user_id={request.user_id}, date={request.date}")
+    print(f"🎯 timeline-v2 処理開始: device_id={request.device_id}, date={request.date}")
     
     # 日付形式の検証
     try:
@@ -774,7 +774,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
     print(f"📋 処理対象スロット数: {len(all_slots)}")
     
     # ローカル出力ディレクトリを作成
-    output_dir = create_output_directory(request.user_id, request.date)
+    output_dir = create_output_directory(request.device_id, request.date)
     
     processed_slots = []
     
@@ -787,7 +787,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
             print(f"🕒 処理中のスロット: {slot}")
             
             # 音声ファイルをダウンロード
-            audio_content = await download_audio_file(session, request.user_id, request.date, slot)
+            audio_content = await download_audio_file(session, request.device_id, request.date, slot)
             
             if audio_content is None:
                 print(f"⏭️ スキップ: {slot}")
@@ -809,7 +809,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
             json_file_path = save_slot_result(output_dir, slot, timeline_data)
             
             # EC2にアップロード
-            upload_success = await upload_sed_json_to_ec2(request.user_id, request.date, slot, json_file_path)
+            upload_success = await upload_sed_json_to_ec2(request.device_id, request.date, slot, json_file_path)
             if upload_success:
                 print(f"📤 EC2アップロード成功: {slot}")
             else:
@@ -829,7 +829,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
     
     # 処理サマリーもJSONファイルに保存
     summary_data = {
-        "user_id": request.user_id,
+        "device_id": request.device_id,
         "date": request.date,
         "total_processed_slots": len(processed_slots),
         "total_available_slots": len(all_slots),
@@ -843,7 +843,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
     print(f"📋 処理サマリーを保存: {summary_file}")
     
     return TimelineV2Result(
-        user_id=request.user_id,
+        device_id=request.device_id,
         date=request.date,
         total_processed_slots=len(processed_slots),
         total_available_slots=len(all_slots),
