@@ -5,6 +5,11 @@ from scipy import signal
 import shutil
 import glob
 import time
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# 環境変数を読み込み
+load_dotenv()
 
 # TensorFlowのメモリ使用量を制限
 gpus = tf.config.list_physical_devices('GPU')
@@ -32,14 +37,22 @@ import soundfile as sf
 import aiohttp
 import asyncio
 from datetime import datetime
-import json
-from pathlib import Path
+
+# Supabaseクライアントの初期化
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_KEY')
+
+if not supabase_url or not supabase_key:
+    raise ValueError("SUPABASE_URLおよびSUPABASE_KEYが設定されていません")
+
+supabase: Client = create_client(supabase_url, supabase_key)
+print(f"Supabase接続設定完了: {supabase_url}")
 
 # FastAPIアプリケーションの初期化
 app = FastAPI(
     title="Sound Event Detection API",
-    description="YamNetモデルを使用して音声ファイルからサウンドイベントを検出するAPI（v1.1.0: 自動回復機能搭載）",
-    version="1.1.0"
+    description="YamNetモデルを使用して音声ファイルからサウンドイベントを検出するAPI（v1.2.0: Supabase統合機能搭載）",
+    version="1.2.0"
 )
 
 # CORSミドルウェアの設定
@@ -66,57 +79,126 @@ with open(class_map_path, 'r') as f:
         class_names.append(row[2])
 
 def clear_tfhub_cache():
-    """TensorFlow Hubキャッシュをクリア"""
+    """
+    TensorFlow Hubキャッシュをクリア
+    
+    🔥 キャッシュ破損はTensorFlow Hubでよく発生する問題です
+    症状: 'saved_model.pb' nor 'saved_model.pbtxt' エラー
+    対処: この関数でキャッシュを完全削除して再ダウンロードします
+    """
+    print("🔧 TensorFlow Hubキャッシュのクリアを開始...")
+    cleared_count = 0
+    
     try:
-        # 一般的なキャッシュパス
+        # 💡 キャッシュの一般的な場所
         cache_paths = [
             os.path.expanduser('~/tfhub_modules'),
             '/tmp/tfhub_modules',
+            os.environ.get('TFHUB_CACHE_DIR', ''),  # 環境変数指定のパス
         ]
         
-        # /var/folders以下のキャッシュも検索
+        # 🔍 macOSの一時フォルダ内のキャッシュも検索
         cache_paths.extend(glob.glob('/var/folders/*/T/tfhub_modules*'))
+        cache_paths.extend(glob.glob('/var/folders/*/*/T/tfhub_modules*'))
+        
+        # 空文字列を除去
+        cache_paths = [path for path in cache_paths if path]
+        
+        print(f"📁 検索対象パス: {len(cache_paths)}個")
+        for path in cache_paths:
+            print(f"   - {path}")
         
         for path in cache_paths:
             if os.path.exists(path):
                 try:
                     shutil.rmtree(path)
-                    print(f"キャッシュクリア: {path}")
+                    cleared_count += 1
+                    print(f"✅ キャッシュクリア成功: {path}")
                 except Exception as e:
-                    print(f"キャッシュクリア失敗: {path} - {e}")
+                    print(f"❌ キャッシュクリア失敗: {path} - {e}")
+            else:
+                print(f"⏭️ パス存在せず: {path}")
+                
+        if cleared_count > 0:
+            print(f"🎯 {cleared_count}個のキャッシュディレクトリを削除しました")
+            print("💡 次回のモデルロード時に自動的に再ダウンロードされます")
+        else:
+            print("ℹ️ クリア対象のキャッシュは見つかりませんでした")
+            
     except Exception as e:
-        print(f"キャッシュクリア処理でエラー: {e}")
+        print(f"🚨 キャッシュクリア処理で予期しないエラー: {e}")
+        import traceback
+        traceback.print_exc()
 
 def validate_model_cache():
-    """モデルキャッシュの整合性を確認"""
+    """
+    モデルキャッシュの整合性を確認
+    
+    🔍 TensorFlow Hubキャッシュが破損していないかチェックします
+    破損の特徴: saved_model.pb ファイルが存在しない
+    """
+    print("🔍 TensorFlow Hubキャッシュの整合性チェックを開始...")
+    
     try:
         cache_dir = os.environ.get('TFHUB_CACHE_DIR', '/tmp/tfhub_modules')
         
-        # 一般的なキャッシュディレクトリをチェック
+        # 🔍 一般的なキャッシュディレクトリをチェック
         check_dirs = [
             cache_dir,
             os.path.expanduser('~/tfhub_modules'),
         ]
         check_dirs.extend(glob.glob('/var/folders/*/T/tfhub_modules*'))
+        check_dirs.extend(glob.glob('/var/folders/*/*/T/tfhub_modules*'))
+        
+        # 空文字列を除去
+        check_dirs = [d for d in check_dirs if d]
+        
+        checked_models = 0
+        corrupted_models = 0
         
         for cache_dir in check_dirs:
             if os.path.exists(cache_dir):
-                for model_dir in os.listdir(cache_dir):
-                    model_path = os.path.join(cache_dir, model_dir)
-                    if os.path.isdir(model_path):
-                        saved_model_path = os.path.join(model_path, 'saved_model.pb')
-                        
-                        if not os.path.exists(saved_model_path):
-                            print(f"破損したキャッシュを発見: {model_path}")
-                            try:
-                                shutil.rmtree(model_path)
-                                print(f"破損したキャッシュを削除: {model_path}")
-                            except Exception as e:
-                                print(f"キャッシュ削除失敗: {e}")
-                            return False
+                print(f"📁 チェック中: {cache_dir}")
+                
+                try:
+                    for model_dir in os.listdir(cache_dir):
+                        model_path = os.path.join(cache_dir, model_dir)
+                        if os.path.isdir(model_path):
+                            checked_models += 1
+                            saved_model_path = os.path.join(model_path, 'saved_model.pb')
+                            
+                            if not os.path.exists(saved_model_path):
+                                corrupted_models += 1
+                                print(f"🚨 破損キャッシュ発見: {model_path}")
+                                print(f"   原因: saved_model.pb が存在しません")
+                                try:
+                                    shutil.rmtree(model_path)
+                                    print(f"✅ 破損キャッシュを自動削除: {model_path}")
+                                except Exception as e:
+                                    print(f"❌ キャッシュ削除失敗: {e}")
+                                    return False
+                            else:
+                                print(f"✅ 正常なキャッシュ: {model_dir}")
+                except PermissionError as e:
+                    print(f"⚠️ アクセス権限エラー: {cache_dir} - {e}")
+                except Exception as e:
+                    print(f"❌ ディレクトリ読み取りエラー: {cache_dir} - {e}")
+            else:
+                print(f"⏭️ ディレクトリ存在せず: {cache_dir}")
+        
+        if checked_models == 0:
+            print("ℹ️ キャッシュされたモデルは見つかりませんでした")
+        elif corrupted_models > 0:
+            print(f"🔧 {corrupted_models}/{checked_models} 個の破損キャッシュを修復しました")
+            return False
+        else:
+            print(f"✅ すべてのキャッシュ ({checked_models}個) が正常です")
+        
         return True
     except Exception as e:
-        print(f"キャッシュ検証でエラー: {e}")
+        print(f"🚨 キャッシュ検証で予期しないエラー: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def startup_diagnostics():
@@ -152,48 +234,85 @@ def startup_diagnostics():
     return checks
 
 def load_model_if_needed():
+    """
+    YamNetモデルの遅延ロード（自動回復機能付き）
+    
+    🔥 TensorFlow Hubキャッシュ破損対策:
+    1. キャッシュ整合性チェック
+    2. 破損時の自動クリア
+    3. 最大3回の自動リトライ
+    4. 詳細なエラー情報の表示
+    """
     global model
     if model is None:
-        print("YamNetモデルを必要に応じてロードします...")
+        print("🎯 YamNetモデルを必要に応じてロードします...")
         max_attempts = 3
         
         for attempt in range(max_attempts):
             try:
-                # キャッシュ検証
+                print(f"\n📋 モデルロード試行 {attempt + 1}/{max_attempts}")
+                
+                # 🔍 Step 1: キャッシュ整合性チェック
                 if not validate_model_cache():
-                    print("キャッシュが破損しています。クリアします...")
+                    print("🔧 キャッシュが破損していました。自動修復を実行...")
                     clear_tfhub_cache()
                 
-                # メモリを節約するためにTensorFlowの設定を最適化
+                # 🧹 Step 2: メモリクリア
                 tf.keras.backend.clear_session()
+                print("🧹 TensorFlowメモリをクリアしました")
                 
-                # モデルのロード（タイムアウト付き）
-                print(f"モデルロード試行 {attempt + 1}/{max_attempts}")
-                
-                # 環境変数でダウンロード進捗を表示
+                # 📥 Step 3: モデルダウンロード・ロード
+                print("📥 YamNetモデルをダウンロード中...")
                 os.environ['TFHUB_DOWNLOAD_PROGRESS'] = '1'
                 model = hub.load('https://tfhub.dev/google/yamnet/1')
+                print("✅ モデルダウンロード完了")
                 
-                # 小さなダミーデータで最初の推論を実行してモデルを初期化
+                # 🧪 Step 4: 動作テスト
+                print("🧪 モデル動作テストを実行中...")
                 dummy_waveform = np.zeros(16000, dtype=np.float32)
                 _ = model(dummy_waveform)
+                print("✅ モデル動作テスト成功")
                 
-                print("YamNetモデルのロード完了")
+                print("🎉 YamNetモデルのロード完了！")
                 break
                 
-            except Exception as e:
-                print(f"モデルロード試行 {attempt + 1} 失敗: {str(e)}")
+            except ValueError as e:
+                error_msg = str(e)
+                if 'saved_model.pb' in error_msg or 'saved_model.pbtxt' in error_msg:
+                    print(f"🚨 TensorFlow Hubキャッシュ破損エラー検出!")
+                    print(f"   エラー詳細: {error_msg}")
+                    print(f"   原因: キャッシュディレクトリ内のモデルファイルが不完全")
+                    print(f"   対処: キャッシュを削除して再ダウンロードします")
+                else:
+                    print(f"❌ ValueError: {error_msg}")
+                
                 if attempt < max_attempts - 1:
-                    print(f"5秒後に再試行します...")
+                    print(f"🔄 {5}秒後に再試行します...")
                     time.sleep(5)
-                    # キャッシュをクリアして再試行
                     clear_tfhub_cache()
                 else:
-                    print("全ての試行が失敗しました")
+                    print("🚨 全ての試行が失敗しました")
+                    model = None
+                    raise Exception(f"🚨 YamNetモデルロードに失敗しました（{max_attempts}回試行）\n"
+                                  f"最後のエラー: {error_msg}\n"
+                                  f"💡 対処法: READMEのトラブルシューティングセクションを確認してください")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ 予期しないエラー: {error_msg}")
+                
+                if attempt < max_attempts - 1:
+                    print(f"🔄 {5}秒後に再試行します...")
+                    time.sleep(5)
+                    clear_tfhub_cache()
+                else:
+                    print("🚨 全ての試行が失敗しました")
                     import traceback
                     traceback.print_exc()
                     model = None
-                    raise Exception(f"モデルロードに失敗しました（{max_attempts}回試行）: {str(e)}")
+                    raise Exception(f"🚨 YamNetモデルロードに失敗しました（{max_attempts}回試行）\n"
+                                  f"最後のエラー: {error_msg}\n"
+                                  f"💡 対処法: READMEのトラブルシューティングセクションを確認してください")
     
     return model
 
@@ -206,78 +325,88 @@ def generate_time_slots():
             slots.append(slot)
     return slots
 
-def create_output_directory(device_id: str, date: str):
+def convert_to_new_format(device_id: str, date: str, time_block: str, timeline_events: List[Dict], slot_timeline: List[Dict]):
     """
-    ローカル出力ディレクトリを作成する
-    例: /Users/kaya.matsumoto/data/data_accounts/device123/2025-06-18/sed/
-    """
-    base_path = Path("/Users/kaya.matsumoto/data/data_accounts")
-    output_dir = base_path / device_id / date / "sed"
-    
-    # ディレクトリを作成（親ディレクトリも含めて）
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"📁 出力ディレクトリを作成/確認: {output_dir}")
-    
-    return output_dir
-
-def save_slot_result(output_dir: Path, slot: str, timeline_data: dict):
-    """
-    スロットの処理結果をJSONファイルとして保存する
-    """
-    output_file = output_dir / f"{slot}.json"
-    
-    # タイムライン結果をファイルに保存
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(timeline_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"💾 保存完了: {output_file}")
-    return output_file
-
-async def upload_sed_json_to_ec2(device_id: str, date: str, slot: str, json_file_path: Path):
-    """
-    ローカルのSED JSONファイルをEC2にアップロードする
+    現在のタイムラインデータを新しいテーブル構造に変換する
     
     Args:
         device_id: デバイスID
         date: 日付（YYYY-MM-DD）
-        slot: スロット（HH-MM）
-        json_file_path: ローカルJSONファイルのパス
+        time_block: 時間ブロック（HH-MM）
+        timeline_events: 元のタイムラインイベント
+        slot_timeline: 元のスロットタイムライン
     
     Returns:
-        bool: アップロード成功/失敗
+        新しい構造のevents配列
     """
-    upload_url = "https://api.hey-watch.me/upload/analysis/sed-timeline"
+    # 全てのイベントを統合して、重複を除去
+    all_events = {}
     
-    try:
-        print(f"☁️ EC2アップロード開始: {slot}")
+    # timeline_eventsから抽出
+    for event in timeline_events:
+        label = event['label']
+        prob = event['prob']
         
-        async with aiohttp.ClientSession() as session:
-            # ファイルを読み込み
-            with open(json_file_path, 'rb') as f:
-                file_content = f.read()
+        # 同じラベルがあった場合は最大確率を採用
+        if label in all_events:
+            all_events[label] = max(all_events[label], prob)
+        else:
+            all_events[label] = prob
+    
+    # slot_timelineからも抽出（念のため）
+    for slot in slot_timeline:
+        for event in slot['events']:
+            label = event['label']
+            prob = event['prob']
             
-            # FormDataを作成
-            data = aiohttp.FormData()
-            data.add_field('device_id', device_id)
-            data.add_field('date', date)
-            data.add_field('time_block', slot)  # EC2側で期待されるフィールド名に変更
-            data.add_field('file', file_content, filename=f"{slot}.json", content_type='application/json')
+            if label in all_events:
+                all_events[label] = max(all_events[label], prob)
+            else:
+                all_events[label] = prob
+    
+    # 新しい形式のevents配列を生成
+    events = [
+        {"label": label, "prob": prob}
+        for label, prob in sorted(all_events.items(), key=lambda x: x[1], reverse=True)
+    ]
+    
+    return events
+
+async def save_to_supabase(device_id: str, date: str, time_block: str, events: List[Dict]):
+    """
+    Supabaseのbehavior_yamnetテーブルに保存（UPSERT）
+    
+    Args:
+        device_id: デバイスID
+        date: 日付（YYYY-MM-DD）
+        time_block: 時間ブロック（HH-MM）
+        events: イベント配列
+    
+    Returns:
+        bool: 保存成功/失敗
+    """
+    try:
+        supabase_data = {
+            "device_id": device_id,
+            "date": date,
+            "time_block": time_block,
+            "events": events
+        }
+        
+        # UPSERTでデータを保存
+        result = supabase.table('behavior_yamnet').upsert(supabase_data).execute()
+        
+        if result.data:
+            print(f"💾 Supabase保存成功: {time_block} ({len(events)}件のイベント)")
+            return True
+        else:
+            print(f"❌ Supabase保存失敗: {time_block}")
+            return False
             
-            # アップロードリクエスト送信
-            async with session.post(upload_url, data=data) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    print(f"✅ EC2アップロード成功: {slot} → {result.get('path', 'N/A')}")
-                    return True
-                else:
-                    error_text = await response.text()
-                    print(f"❌ EC2アップロード失敗: {slot} (ステータス: {response.status})")
-                    print(f"   エラー詳細: {error_text}")
-                    return False
-                    
     except Exception as e:
-        print(f"❌ EC2アップロード中にエラー: {slot} - {str(e)}")
+        print(f"❌ Supabase保存エラー: {time_block} - {str(e)}")
         return False
+
 
 async def download_audio_file(session: aiohttp.ClientSession, device_id: str, date: str, slot: str):
     """
@@ -480,6 +609,12 @@ class SummaryResult(BaseModel):
 class TimelineV2Request(BaseModel):
     device_id: str
     date: str  # YYYY-MM-DD形式
+
+# fetch-and-process用のモデル
+class FetchAndProcessRequest(BaseModel):
+    device_id: str
+    date: str
+    threshold: float = 0.2
 
 class SlotTimelineData(BaseModel):
     slot: str  # HH-MM形式
@@ -773,9 +908,6 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
     all_slots = generate_time_slots()
     print(f"📋 処理対象スロット数: {len(all_slots)}")
     
-    # ローカル出力ディレクトリを作成
-    output_dir = create_output_directory(request.device_id, request.date)
-    
     processed_slots = []
     
     # HTTP接続セッションを作成
@@ -800,20 +932,15 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
                 print(f"❌ 処理失敗: {slot}")
                 continue
             
-            # 結果をローカルファイルに保存
-            timeline_data = {
-                "slot": slot,
-                "timeline": result["timeline"],
-                "slot_timeline": result["slot_timeline"]
-            }
-            json_file_path = save_slot_result(output_dir, slot, timeline_data)
+            # 新しいデータ構造に変換
+            events = convert_to_new_format(request.device_id, request.date, slot, result["timeline"], result["slot_timeline"])
             
-            # EC2にアップロード
-            upload_success = await upload_sed_json_to_ec2(request.device_id, request.date, slot, json_file_path)
-            if upload_success:
-                print(f"📤 EC2アップロード成功: {slot}")
+            # Supabaseに保存
+            supabase_success = await save_to_supabase(request.device_id, request.date, slot, events)
+            if supabase_success:
+                print(f"💾 Supabase保存成功: {slot}")
             else:
-                print(f"⚠️ EC2アップロード失敗（処理は継続）: {slot}")
+                print(f"⚠️ Supabase保存失敗（処理は継続）: {slot}")
             
             # 結果を追加
             slot_data = SlotTimelineData(
@@ -825,22 +952,7 @@ async def analyze_sed_timeline_v2(request: TimelineV2Request, threshold: Optiona
             print(f"✅ 処理完了: {slot} ({len(result['timeline'])}件のイベント)")
     
     print(f"🎉 全体処理完了: {len(processed_slots)}/{len(all_slots)} スロット処理済み")
-    print(f"📂 保存先ディレクトリ: {output_dir}")
-    
-    # 処理サマリーもJSONファイルに保存
-    summary_data = {
-        "device_id": request.device_id,
-        "date": request.date,
-        "total_processed_slots": len(processed_slots),
-        "total_available_slots": len(all_slots),
-        "processed_slot_names": [slot.slot for slot in processed_slots],
-        "processing_timestamp": datetime.now().isoformat()
-    }
-    
-    summary_file = output_dir / "processing_summary.json"
-    with open(summary_file, 'w', encoding='utf-8') as f:
-        json.dump(summary_data, f, ensure_ascii=False, indent=2)
-    print(f"📋 処理サマリーを保存: {summary_file}")
+    print(f"💾 すべてSupabaseに直接保存されました")
     
     return TimelineV2Result(
         device_id=request.device_id,
@@ -999,6 +1111,102 @@ async def analyze_sed_summary(file: UploadFile = File(...), threshold: Optional[
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"音声分析中に予期しないエラーが発生しました: {str(e)}")
 
+@app.post("/fetch-and-process")
+async def fetch_and_process(request: FetchAndProcessRequest):
+    """
+    指定されたデバイス・日付の.wavファイルをAPIから取得し、一括音響イベント検出を行い、
+    結果をSupabaseのbehavior_yamnetテーブルに保存する
+    """
+    device_id = request.device_id
+    date = request.date
+    threshold = request.threshold
+    
+    print(f"Supabaseへの直接保存モードで実行中")
+    print(f"\n=== 一括取得・音響イベント検出開始 ===")
+    print(f"デバイスID: {device_id}")
+    print(f"対象日付: {date}")
+    print(f"閾値: {threshold}")
+    print(f"保存先: Supabase behavior_yamnet テーブル")
+    print(f"=" * 50)
+    
+    # 24時間分のスロットを生成
+    all_slots = generate_time_slots()
+    print(f"📋 処理対象スロット数: {len(all_slots)}")
+    
+    fetched = []
+    processed = []
+    skipped = []
+    errors = []
+    saved_to_supabase = []
+    
+    # HTTP接続セッションを作成
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        
+        # 各スロットを順次処理
+        for slot in all_slots:
+            try:
+                print(f"📝 処理開始: {slot}")
+                
+                # 音声ファイルをダウンロード
+                audio_content = await download_audio_file(session, device_id, date, slot)
+                
+                if audio_content is None:
+                    print(f"⏭️ データなし: {slot}")
+                    skipped.append(slot)
+                    continue
+                
+                print(f"📥 取得: {slot}.wav")
+                fetched.append(f"{slot}.wav")
+                
+                # 音声データを処理
+                result = process_audio_data(audio_content, threshold)
+                
+                if result is None:
+                    print(f"❌ 処理失敗: {slot}")
+                    errors.append(slot)
+                    continue
+                
+                # 新しいデータ構造に変換
+                events = convert_to_new_format(device_id, date, slot, result["timeline"], result["slot_timeline"])
+                
+                # Supabaseに保存
+                supabase_success = await save_to_supabase(device_id, date, slot, events)
+                if supabase_success:
+                    saved_to_supabase.append(slot)
+                    processed.append(slot)
+                    print(f"✅ 完了: {slot} ({len(events)}件のイベント)")
+                else:
+                    errors.append(slot)
+                    
+            except Exception as e:
+                print(f"❌ エラー: {slot} - {str(e)}")
+                errors.append(slot)
+    
+    print(f"\n=== 一括取得・音響イベント検出・Supabase保存完了 ===")
+    print(f"📥 音声取得成功: {len(fetched)} ファイル")
+    print(f"📝 処理対象: {len(processed)} ファイル")
+    print(f"💾 Supabase保存成功: {len(saved_to_supabase)} ファイル")
+    print(f"⏭️ スキップ: {len(skipped)} ファイル (データなし)")
+    print(f"❌ エラー: {len(errors)} ファイル")
+    print(f"=" * 50)
+    
+    return {
+        "status": "success",
+        "fetched": fetched,
+        "processed": processed,
+        "saved_to_supabase": saved_to_supabase,
+        "skipped": skipped,
+        "errors": errors,
+        "summary": {
+            "total_time_blocks": len(all_slots),
+            "audio_fetched": len(fetched),
+            "supabase_saved": len(saved_to_supabase),
+            "skipped_no_data": len(skipped),
+            "errors": len(errors)
+        }
+    }
+
 @app.get("/")
 def read_root():
     return {"message": "Sound Event Detection API is running"}
@@ -1035,6 +1243,74 @@ def test_api():
         return {
             "status": "error",
             "error": str(e)
+        }
+
+@app.post("/debug/clear-cache")
+def clear_cache_endpoint():
+    """
+    🔧 TensorFlow Hubキャッシュを手動でクリアするデバッグエンドポイント
+    
+    用途: 
+    - キャッシュ破損問題のトラブルシューティング
+    - モデルロードエラーの解決
+    
+    使用方法:
+    curl -X POST http://localhost:8004/debug/clear-cache
+    """
+    try:
+        print("🔧 手動キャッシュクリアが要求されました")
+        clear_tfhub_cache()
+        
+        # グローバルモデルもリセット
+        global model
+        model = None
+        print("🔄 モデルインスタンスもリセットしました")
+        
+        return {
+            "status": "success",
+            "message": "TensorFlow Hubキャッシュをクリアしました",
+            "note": "次回のモデルロード時に自動的に再ダウンロードされます",
+            "model_reset": True
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "キャッシュクリアに失敗しました"
+        }
+
+@app.get("/debug/cache-status")
+def cache_status_endpoint():
+    """
+    🔍 TensorFlow Hubキャッシュの状態を確認するデバッグエンドポイント
+    
+    用途:
+    - キャッシュの健全性チェック
+    - 破損キャッシュの事前検出
+    
+    使用方法:
+    curl http://localhost:8004/debug/cache-status
+    """
+    try:
+        print("🔍 キャッシュ状態の確認が要求されました")
+        is_valid = validate_model_cache()
+        
+        return {
+            "status": "success",
+            "cache_valid": is_valid,
+            "model_loaded": model is not None,
+            "message": "正常なキャッシュです" if is_valid else "キャッシュに問題があります",
+            "recommendation": "問題なし" if is_valid else "POST /debug/clear-cache でキャッシュをクリアしてください"
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "キャッシュ状態の確認に失敗しました"
         }
 
 if __name__ == "__main__":

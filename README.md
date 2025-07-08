@@ -10,16 +10,100 @@ YamNetモデルを使用して音声ファイルからサウンドイベント�
 ## 技術仕様
 
 - **使用モデル**: Google YamNet
-- **言語環境**: Python 3.11.8
-- **実行方式**: FastAPI + 仮想環境
+- **言語環境**: Python 3.11.8 (仮想環境必須)
+- **実行方式**: FastAPI + venv仮想環境
 - **ポート番号**: 8004
-- **バージョン**: v1.1.0（自動回復機能搭載）
+
+## ⚠️ 重要: 仮想環境での実行が必須
+
+このAPIは**仮想環境(venv)**で実行する必要があります。必要な依存関係（TensorFlow、YamNetなど）は仮想環境内にインストールされています。
+
+### 正しい起動方法
+```bash
+# 方法1: 起動スクリプトを使用（推奨）
+./start_sed_api.sh
+
+# 方法2: 手動で仮想環境を有効化
+source venv/bin/activate
+python main.py
+```
+
+### 🚨 よくある間違い
+```bash
+# ❌ 間違い: システムPythonで実行
+python3 main.py  # → TensorFlowが見つからないエラー
+
+# ✅ 正解: 仮想環境で実行
+source venv/bin/activate && python main.py
+```
+- **バージョン**: v1.2.0（Supabase統合機能搭載）
 - **対応フォーマット**: WAV形式（任意のサンプルレート・チャンネル数）
 - **処理時間**: 最大60秒（それ以上は自動切り詰め）
 
 ## エンドポイント一覧
 
-### 🚀 **1. タイムライン検出v2 - `/analyze/sed/timeline-v2` (POST) [メイン機能]**
+### 🚀 **1. fetch-and-process - `/fetch-and-process` (POST) [新メイン機能]**
+
+**Supabase統合エンドポイント**  
+指定されたデバイス・日付の.wavファイルをAPIから取得し、一括音響イベント検出を行い、結果をSupabaseのbehavior_yamnetテーブルに直接保存します。
+
+#### 用途
+- **WatchMe行動グラフダッシュボード**: リアルタイムデータベース連携
+- **自動データ処理**: 音声取得から分析、保存まで一括処理
+- **統合システム**: 他のAPIとの連携によるデータ統合
+
+#### リクエスト
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"device_id": "device123", "date": "2025-07-08", "threshold": 0.2}' \
+  "http://localhost:8004/fetch-and-process"
+```
+
+#### パラメータ
+- `device_id` (必須): デバイスID
+- `date` (必須): 日付（YYYY-MM-DD形式）
+- `threshold` (オプション): 確信度の閾値（デフォルト: 0.2）
+
+#### レスポンス例
+```json
+{
+  "status": "success",
+  "fetched": ["18-00.wav", "18-30.wav"],
+  "processed": ["18-00", "18-30"],
+  "saved_to_supabase": ["18-00", "18-30"],
+  "skipped": ["00-00", "00-30", "01-00"],
+  "errors": [],
+  "summary": {
+    "total_time_blocks": 48,
+    "audio_fetched": 2,
+    "supabase_saved": 2,
+    "skipped_no_data": 46,
+    "errors": 0
+  }
+}
+```
+
+#### Supabaseテーブル構造 (behavior_yamnet)
+```sql
+CREATE TABLE behavior_yamnet (
+  device_id     text NOT NULL,
+  date          date NOT NULL,
+  time_block    text NOT NULL CHECK (time_block ~ '^[0-2][0-9]-[0-5][0-9]$'),
+  events        jsonb NOT NULL,
+  PRIMARY KEY (device_id, date, time_block)
+);
+```
+
+#### 保存されるeventsデータ例
+```json
+[
+  {"label": "Speech", "prob": 0.98},
+  {"label": "Silence", "prob": 1.0},
+  {"label": "Inside, small room", "prob": 0.31}
+]
+```
+
+### 🚀 **2. タイムライン検出v2 - `/analyze/sed/timeline-v2` (POST) [従来機能]**
 
 **行動グラフダッシュボード専用エンドポイント**  
 EC2上の音声ファイルを逐次処理してタイムライン分析を実行します。24時間分の30分単位スロット（48個）を対象とし、存在しないファイルは無視します。
@@ -239,29 +323,156 @@ python main.py
 
 ## 🔧 **トラブルシューティング**
 
-### **YamNetモデルロード失敗（最重要）**
+### 🚨 **TensorFlow Hubキャッシュ破損エラー (最頻出問題)**
 
-**症状**: 
+**症状:**
 ```
 ValueError: Trying to load a model of incompatible/unknown type. 
 '/var/folders/.../tfhub_modules/...' contains neither 'saved_model.pb' nor 'saved_model.pbtxt'.
 ```
 
-**原因**: TensorFlow Hubキャッシュファイルの破損
+**原因:** TensorFlow Hubのモデルキャッシュが破損しています。これは**頻繁に発生する既知の問題**です。
 
-**🆕 v1.1.0 自動回復機能**:
-APIに以下の自動回復機能が実装されました：
-- **起動時診断**: API起動時に全コンポーネントの正常性を自動チェック
-- **キャッシュ検証**: モデルキャッシュの整合性を自動確認
-- **自動リトライ**: モデル読み込み失敗時の自動キャッシュクリア＆再試行（最大3回）
-- **診断ログ**: 起動時に以下が表示されます
-  ```
-  === 起動時診断結果 ===
-  ✅ TensorFlow: 正常
-  ✅ TensorFlow Hub: 正常
-  ✅ モデルキャッシュ: 正常
-  =========================
-  ```
+**🆕 v1.2.0 強化された自動回復機能:**
+- **詳細診断**: キャッシュ破損の具体的な原因特定
+- **自動検出**: 起動時とモデルロード時の二重チェック
+- **完全修復**: 破損キャッシュの自動削除と再ダウンロード
+- **分かりやすいログ**: 絵文字とステップ表示でエラー原因を明確化
+
+**解決法 (自動):**
+```bash
+# APIには自動回復機能が組み込まれています
+# エラー発生時に自動的にキャッシュをクリアして再試行されます
+
+# ログ例:
+🚨 TensorFlow Hubキャッシュ破損エラー検出!
+   エラー詳細: contains neither 'saved_model.pb' nor 'saved_model.pbtxt'
+   原因: キャッシュディレクトリ内のモデルファイルが不完全
+   対処: キャッシュを削除して再ダウンロードします
+🔄 5秒後に再試行します...
+```
+
+**解決法 (手動):**
+```bash
+# 方法1: デバッグエンドポイントを使用 (推奨)
+curl -X POST http://localhost:8004/debug/clear-cache
+
+# 方法2: 手動でキャッシュ削除
+rm -rf /var/folders/*/T/tfhub_modules*
+rm -rf ~/tfhub_modules
+rm -rf /tmp/tfhub_modules
+
+# 方法3: 仮想環境でスクリプト実行
+source venv/bin/activate
+python3 -c "
+import shutil, glob, os
+for path in glob.glob('/var/folders/*/T/tfhub_modules*'):
+    if os.path.exists(path): shutil.rmtree(path)
+print('キャッシュクリア完了')
+"
+```
+
+**予防策:**
+```bash
+# キャッシュ状態の事前チェック
+curl http://localhost:8004/debug/cache-status
+```
+
+### 🚨 **仮想環境エラー**
+
+**症状:**
+```
+ModuleNotFoundError: No module named 'tensorflow'
+```
+
+**解決法:**
+```bash
+# 必ず仮想環境で実行
+source venv/bin/activate
+python main.py
+
+# または起動スクリプトを使用
+./start_sed_api.sh
+```
+
+### 🚨 **メモリ不足エラー**
+
+**症状:**
+```
+OutOfMemoryError: CUDA out of memory
+```
+
+**解決法:**
+```bash
+# 他のプロセスを停止
+pkill -f python
+
+# APIを再起動
+source venv/bin/activate && python main.py
+```
+
+### 🚨 **ポート競合エラー**
+
+**症状:**
+```
+Address already in use: 8004
+```
+
+**解決法:**
+```bash
+# ポート使用状況確認
+lsof -i :8004
+
+# プロセス終了
+kill -9 <PID>
+
+# API再起動
+source venv/bin/activate && python main.py
+```
+
+### 🔍 **新しいデバッグエンドポイント**
+
+**キャッシュ状態確認:**
+```bash
+curl http://localhost:8004/debug/cache-status
+```
+
+**キャッシュ手動クリア:**
+```bash
+curl -X POST http://localhost:8004/debug/clear-cache
+```
+
+**API基本動作確認:**
+```bash
+curl http://localhost:8004/test
+```
+
+### 💡 **プロアクティブ対策**
+
+1. **定期的なキャッシュチェック**: 週1回程度 `debug/cache-status` で確認
+2. **仮想環境の確認**: 起動前に `which python` で確認
+3. **メモリ監視**: 長時間稼働時は定期的な再起動
+4. **ログ監視**: エラーログの定期確認
+
+### **診断ログの読み方**
+
+**正常起動時:**
+```
+=== 起動時診断結果 ===
+✅ TensorFlow: 正常
+✅ TensorFlow Hub: 正常
+✅ モデルキャッシュ: 正常
+=========================
+```
+
+**キャッシュ破損検出時:**
+```
+🔍 TensorFlow Hubキャッシュの整合性チェックを開始...
+🚨 破損キャッシュ発見: /var/folders/.../tfhub_modules/xxx
+   原因: saved_model.pb が存在しません
+✅ 破損キャッシュを自動削除: /var/folders/.../tfhub_modules/xxx
+🔧 1/1 個の破損キャッシュを修復しました
+```
 
 **手動解決方法**（自動回復が効かない場合）:
 ```bash
