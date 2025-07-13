@@ -5,6 +5,8 @@ services:
     build: .
     ports:
       - "8004:8004"
-    volumes:
-      - .:/app
-    restart: unless-stopped 
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped

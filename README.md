@@ -5,8 +5,11 @@ YamNetモデルを使用して音声ファイルからサウンドイベント�
 
 ## 📝 **リポジトリ変更履歴**
 
-**2025-07-13**: リポジトリ名を `sed.git` から `watchme-behavior-yamnet.git` に変更しました。  
-この変更により、WatchMeプロジェクトの命名規則に統一し、機能をより明確に表現できるようになりました。
+**2025-07-13**: 
+- リポジトリ名を `sed.git` から `watchme-behavior-yamnet.git` に変更しました。  
+- Docker化による本番環境デプロイを実施しました。
+- AWS EC2 (3.24.16.82) に正常デプロイ完了。
+- systemdサービス化により常時稼働を実現。
 
 ## 🎯 **メイン機能**
 
@@ -646,6 +649,166 @@ with st.form("sed_form"):
             result = call_sed_timeline_v2(device_id, str(date))
         else:
             st.error("デバイスIDと日付を入力してください")
+```
+
+## 🚀 本番環境設定（AWS EC2）
+
+### 本番環境情報
+- **サーバー**: AWS EC2 (Ubuntu)
+- **IPアドレス**: 3.24.16.82
+- **ディレクトリ**: `/home/ubuntu/watchme-behavior-yamnet`
+- **ポート**: 8004
+- **コンテナ名**: sed_api
+
+### 本番環境へのデプロイ手順（Docker使用）
+
+#### 1️⃣ Dockerイメージのビルド（ローカル環境）
+```bash
+# requirements-docker.txtを作成（Linux用に調整）
+# tensorflow-macosをtensorflowに変更
+# バージョン制約を緩める
+
+# Dockerイメージをビルド
+docker build -t watchme-behavior-yamnet:latest .
+
+# イメージをtar形式で保存
+docker save watchme-behavior-yamnet:latest | gzip > watchme-behavior-yamnet.tar.gz
+```
+
+#### 2️⃣ 本番環境への転送
+```bash
+# SSHキーを使用してイメージを転送
+scp -i ~/watchme-key.pem watchme-behavior-yamnet.tar.gz ubuntu@3.24.16.82:/home/ubuntu/
+
+# 本番環境にSSH接続
+ssh -i ~/watchme-key.pem ubuntu@3.24.16.82
+```
+
+#### 3️⃣ 本番環境でのセットアップ
+```bash
+# Dockerイメージをロード
+gunzip -c /home/ubuntu/watchme-behavior-yamnet.tar.gz | docker load
+
+# ディレクトリ作成
+mkdir -p /home/ubuntu/watchme-behavior-yamnet
+
+# .envファイルを作成（Supabase接続情報）
+cat > /home/ubuntu/watchme-behavior-yamnet/.env << 'EOF'
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_key
+EOF
+
+# Dockerコンテナとして起動（テスト）
+docker run -d --restart unless-stopped -p 8004:8004 \
+  --env-file /home/ubuntu/watchme-behavior-yamnet/.env \
+  --name sed_api watchme-behavior-yamnet:latest
+```
+
+### systemdサービス設定（自動起動）
+
+#### 1️⃣ サービスファイルの作成
+```bash
+sudo vi /etc/systemd/system/watchme-behavior-yamnet.service
+```
+
+以下の内容を記載：
+```ini
+[Unit]
+Description=WatchMe Behavior YamNet (Sound Event Detection) API Service
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+ExecStartPre=-/usr/bin/docker stop sed_api
+ExecStartPre=-/usr/bin/docker rm sed_api
+ExecStart=/usr/bin/docker run --rm --name sed_api -p 8004:8004 --env-file /home/ubuntu/watchme-behavior-yamnet/.env watchme-behavior-yamnet:latest
+ExecStop=/usr/bin/docker stop sed_api
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 2️⃣ サービスの有効化と起動
+```bash
+# systemdのリロード
+sudo systemctl daemon-reload
+
+# サービスを有効化（自動起動設定）
+sudo systemctl enable watchme-behavior-yamnet.service
+
+# サービスを起動
+sudo systemctl start watchme-behavior-yamnet.service
+```
+
+#### 3️⃣ サービス管理コマンド
+```bash
+# サービス状態確認
+sudo systemctl status watchme-behavior-yamnet.service
+
+# サービス再起動
+sudo systemctl restart watchme-behavior-yamnet.service
+
+# サービス停止
+sudo systemctl stop watchme-behavior-yamnet.service
+
+# ログ確認（systemd）
+sudo journalctl -u watchme-behavior-yamnet.service -f
+
+# ログ確認（Docker）
+docker logs sed_api
+```
+
+### 本番環境での動作確認
+
+#### APIヘルスチェック
+```bash
+# サーバー内から
+curl http://localhost:8004/
+
+# 外部から（ポートが開放されている場合）
+curl http://3.24.16.82:8004/
+```
+
+#### 音声イベント検出テスト
+```bash
+# fetch-and-processエンドポイントで実行
+curl -X POST http://localhost:8004/fetch-and-process \
+  -H "Content-Type: application/json" \
+  -d '{"device_id": "d067d407-cf73-4174-a9c1-d91fb60d64d0", "date": "2025-07-10", "threshold": 0.2}'
+```
+
+### トラブルシューティング
+
+#### Dockerイメージのビルドエラー
+```bash
+# 依存関係の競合が発生した場合
+# requirements-docker.txtでバージョン制約を緩める
+# 例: tensorflow>=2.16.0,<2.20.0
+#     numpy>=1.26.0
+#     scipy>=1.11.0
+```
+
+#### systemdサービスが起動しない場合
+```bash
+# エラーログを確認
+sudo journalctl -u watchme-behavior-yamnet.service -n 50 --no-pager
+
+# Dockerコンテナの状態確認
+docker ps -a | grep sed_api
+
+# 手動でDockerコンテナを起動してエラー確認
+docker run --rm -p 8004:8004 --env-file /home/ubuntu/watchme-behavior-yamnet/.env watchme-behavior-yamnet:latest
+```
+
+#### TensorFlow Hubキャッシュエラー
+```bash
+# コンテナ内のキャッシュをクリア
+docker exec sed_api rm -rf /tmp/tfhub_modules*
+docker restart sed_api
 ```
 
 ## 注意事項
