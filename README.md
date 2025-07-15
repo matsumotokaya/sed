@@ -3,7 +3,19 @@
 YamNetモデルを使用して音声ファイルからサウンドイベントを検出するAPIです。  
 **WatchMeライフログサービスの行動グラフダッシュボード**で使用される音声分析エンジンです。
 
+## 🌐 外部公開URL
+
+**本番環境URL**: `https://api.hey-watch.me/behavior-features/`
+
+- マイクロサービスとして外部から利用可能
+- SSL/HTTPS対応
+- CORS設定済み
+
 ## 📝 **リポジトリ変更履歴**
+
+**2025-07-15**:
+- 外部URL公開: `https://api.hey-watch.me/behavior-features/` で外部アクセス可能
+- Nginxリバースプロキシ設定: SSL/HTTPS対応、CORS設定完了
 
 **2025-07-13**: 
 - リポジトリ名を `sed.git` から `watchme-behavior-yamnet.git` に変更しました。  
@@ -62,9 +74,15 @@ source venv/bin/activate && python main.py
 
 #### リクエスト
 ```bash
+# ローカル環境
 curl -X POST -H "Content-Type: application/json" \
   -d '{"device_id": "device123", "date": "2025-07-08", "threshold": 0.2}' \
   "http://localhost:8004/fetch-and-process"
+
+# 本番環境（外部URL）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"device_id": "device123", "date": "2025-07-08", "threshold": 0.2}' \
+  "https://api.hey-watch.me/behavior-features/fetch-and-process"
 ```
 
 #### パラメータ
@@ -123,9 +141,15 @@ EC2上の音声ファイルを逐次処理してタイムライン分析を実�
 
 #### リクエスト
 ```bash
+# ローカル環境
 curl -X POST -H "Content-Type: application/json" \
   -d '{"device_id": "device123", "date": "2025-06-21"}' \
   "http://localhost:8004/analyze/sed/timeline-v2?threshold=0.2"
+
+# 本番環境（外部URL）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"device_id": "device123", "date": "2025-06-21"}' \
+  "https://api.hey-watch.me/behavior-features/analyze/sed/timeline-v2?threshold=0.2"
 ```
 
 #### パラメータ
@@ -283,7 +307,11 @@ APIの動作確認用エンドポイント
 
 #### リクエスト
 ```bash
+# ローカル環境
 curl http://localhost:8004/
+
+# 本番環境（外部URL）
+curl https://api.hey-watch.me/behavior-features/
 ```
 
 #### レスポンス
@@ -297,7 +325,11 @@ curl http://localhost:8004/
 
 #### リクエスト
 ```bash
+# ローカル環境
 curl http://localhost:8004/test
+
+# 本番環境（外部URL）
+curl https://api.hey-watch.me/behavior-features/test
 ```
 
 ## セットアップと実行方法
@@ -604,7 +636,8 @@ from datetime import datetime
 def call_sed_timeline_v2(device_id: str, date: str):
     """行動グラフ用SED分析を実行"""
     
-    url = "http://localhost:8004/analyze/sed/timeline-v2"
+    # 本番環境URL（外部アクセス）
+    url = "https://api.hey-watch.me/behavior-features/analyze/sed/timeline-v2"
     payload = {"device_id": device_id, "date": date}
     
     try:
@@ -818,6 +851,68 @@ docker restart sed_api
 - **メモリ使用量**: 大きなファイルでは一時的にメモリを多く消費
 - **同時接続**: 同時に複数のリクエストを処理可能
 - **安全な運用**: 同じデバイス・日付の同時処理は避ける（ファイル競合リスク）
+
+## 🔗 マイクロサービス統合
+
+### 外部サービスからの利用方法
+
+```python
+import requests
+import asyncio
+import aiohttp
+
+# 同期版
+def analyze_sound_events(device_id: str, date: str):
+    url = "https://api.hey-watch.me/behavior-features/fetch-and-process"
+    data = {"device_id": device_id, "date": date, "threshold": 0.2}
+    
+    response = requests.post(url, json=data)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"API Error: {response.text}")
+
+# 非同期版
+async def analyze_sound_events_async(device_id: str, date: str):
+    url = "https://api.hey-watch.me/behavior-features/fetch-and-process"
+    data = {"device_id": device_id, "date": date, "threshold": 0.2}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                raise Exception(f"API Error: {await response.text()}")
+
+# 使用例
+result = analyze_sound_events("d067d407-cf73-4174-a9c1-d91fb60d64d0", "2025-07-15")
+print(result)
+```
+
+### 利用可能なエンドポイント
+
+| エンドポイント | メソッド | 説明 |
+|---------------|---------|------|
+| `/` | GET | ヘルスチェック |
+| `/test` | GET | 依存関係確認 |
+| `/fetch-and-process` | POST | Supabase統合処理 |
+| `/analyze/sed/timeline-v2` | POST | タイムライン分析 |
+| `/analyze/sed/timeline` | POST | フレーム単位分析 |
+| `/analyze/sed` | POST | 基本検出 |
+| `/analyze/sed/summary` | POST | 要約検出 |
+
+### APIドキュメント
+
+- **Base URL**: `https://api.hey-watch.me/behavior-features/`
+- **認証**: 不要
+- **CORS**: 有効化済み
+
+### セキュリティ設定
+
+- ✅ HTTPS対応（SSL証明書あり）
+- ✅ CORS設定済み
+- ✅ 適切なヘッダー設定
+- ✅ レート制限対応（Nginxレベル）
 
 ## ライセンス
 
