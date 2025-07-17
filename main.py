@@ -31,7 +31,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 import io
 import soundfile as sf
 import aiohttp
@@ -371,6 +371,72 @@ def convert_to_new_format(device_id: str, date: str, time_block: str, timeline_e
     ]
     
     return events
+
+async def check_existing_data_in_supabase(device_id: str, date: str) -> Set[str]:
+    """
+    Supabaseで既に処理済みのtime_blockを確認
+    
+    Args:
+        device_id: デバイスID
+        date: 日付（YYYY-MM-DD）
+    
+    Returns:
+        処理済みtime_blockのセット
+    """
+    try:
+        # behavior_yamnetテーブルから該当するレコードを検索
+        response = supabase.table('behavior_yamnet').select('time_block').eq('device_id', device_id).eq('date', date).execute()
+        
+        # 処理済みtime_blockのセットを作成
+        existing_time_blocks = {item['time_block'] for item in response.data}
+        
+        print(f"📊 Supabase確認: {len(existing_time_blocks)}件の処理済みスロット")
+        return existing_time_blocks
+        
+    except Exception as e:
+        print(f"❌ Supabase確認エラー: {str(e)}")
+        return set()  # エラー時は空のセットを返す
+
+async def check_audio_exists_in_vault(session: aiohttp.ClientSession, device_id: str, date: str, time_blocks: List[str]) -> Dict[str, bool]:
+    """
+    Vault APIで音声データの存在を確認（並列処理）
+    
+    Args:
+        session: aiohttp セッション
+        device_id: デバイスID
+        date: 日付（YYYY-MM-DD）
+        time_blocks: チェック対象の時間ブロックリスト
+    
+    Returns:
+        {time_block: exists} の辞書
+    """
+    async def check_single_slot(slot: str) -> Tuple[str, bool]:
+        url = f"https://api.hey-watch.me/download"
+        params = {
+            "device_id": device_id,
+            "date": date,
+            "slot": slot
+        }
+        
+        try:
+            # GETリクエスト（HEADは使えないため）
+            async with session.get(url, params=params) as response:
+                # レスポンスボディを読み取って接続を適切にクローズ
+                await response.read()
+                return (slot, response.status == 200)
+        except Exception as e:
+            print(f"❌ Vault APIチェックエラー ({slot}): {str(e)}")
+            return (slot, False)
+    
+    # 並列で全スロットをチェック
+    results = await asyncio.gather(*[check_single_slot(slot) for slot in time_blocks])
+    
+    # 辞書形式で返す
+    exists_dict = dict(results)
+    exists_count = sum(1 for exists in exists_dict.values() if exists)
+    print(f"🔍 Vault API確認: {exists_count}/{len(time_blocks)}件の音声データ存在")
+    
+    return exists_dict
 
 async def save_to_supabase(device_id: str, date: str, time_block: str, events: List[Dict]):
     """
@@ -1116,13 +1182,20 @@ async def fetch_and_process(request: FetchAndProcessRequest):
     """
     指定されたデバイス・日付の.wavファイルをAPIから取得し、一括音響イベント検出を行い、
     結果をSupabaseのbehavior_yamnetテーブルに保存する
+    
+    性能改善版：
+    1. Supabaseで処理済みデータを事前チェック
+    2. Vault APIで音声データの存在を事前確認
+    3. 未処理かつデータ存在のスロットのみ処理
     """
     device_id = request.device_id
     date = request.date
     threshold = request.threshold
     
-    print(f"Supabaseへの直接保存モードで実行中")
-    print(f"\n=== 一括取得・音響イベント検出開始 ===")
+    # 開始時刻を記録
+    start_time = time.time()
+    
+    print(f"\n=== 性能改善版 音響イベント検出開始 ===")
     print(f"デバイスID: {device_id}")
     print(f"対象日付: {date}")
     print(f"閾値: {threshold}")
@@ -1131,20 +1204,79 @@ async def fetch_and_process(request: FetchAndProcessRequest):
     
     # 24時間分のスロットを生成
     all_slots = generate_time_slots()
-    print(f"📋 処理対象スロット数: {len(all_slots)}")
+    print(f"📋 総スロット数: {len(all_slots)}")
     
+    # Step 1: Supabaseで処理済みデータを確認
+    print(f"\n[Step 1] Supabaseで処理済みデータを確認中...")
+    existing_in_db = await check_existing_data_in_supabase(device_id, date)
+    unprocessed_blocks = [slot for slot in all_slots if slot not in existing_in_db]
+    skipped_as_processed = len(existing_in_db)
+    
+    print(f"✅ 処理済みスロット: {skipped_as_processed}個")
+    print(f"📝 未処理スロット: {len(unprocessed_blocks)}個")
+    
+    # 全て処理済みの場合
+    if not unprocessed_blocks:
+        execution_time = time.time() - start_time
+        return {
+            "status": "success",
+            "device_id": device_id,
+            "date": date,
+            "summary": {
+                "total_slots": len(all_slots),
+                "skipped_as_processed_in_db": skipped_as_processed,
+                "skipped_as_no_audio_in_vault": 0,
+                "successfully_transcribed": 0,
+                "errors": 0
+            },
+            "processed_blocks": [],
+            "execution_time_seconds": round(execution_time, 1)
+        }
+    
+    # 処理統計用変数
     fetched = []
     processed = []
     skipped = []
     errors = []
     saved_to_supabase = []
+    skipped_as_no_audio = 0
     
     # HTTP接続セッションを作成
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Step 2: Vault APIで音声データの存在を確認
+        print(f"\n[Step 2] Vault APIで音声データの存在を確認中...")
+        audio_exists = await check_audio_exists_in_vault(session, device_id, date, unprocessed_blocks)
+        blocks_to_process = [slot for slot in unprocessed_blocks if audio_exists.get(slot, False)]
+        skipped_as_no_audio = len(unprocessed_blocks) - len(blocks_to_process)
         
-        # 各スロットを順次処理
-        for slot in all_slots:
+        print(f"✅ 音声データ存在: {len(blocks_to_process)}個")
+        print(f"⏭️ 音声データなし: {skipped_as_no_audio}個")
+        
+        # 処理対象がない場合
+        if not blocks_to_process:
+            execution_time = time.time() - start_time
+            return {
+                "status": "success",
+                "device_id": device_id,
+                "date": date,
+                "summary": {
+                    "total_slots": len(all_slots),
+                    "skipped_as_processed_in_db": skipped_as_processed,
+                    "skipped_as_no_audio_in_vault": skipped_as_no_audio,
+                    "successfully_transcribed": 0,
+                    "errors": 0
+                },
+                "processed_blocks": [],
+                "execution_time_seconds": round(execution_time, 1)
+            }
+        
+        # Step 3: 音声ダウンロードと音響イベント検出
+        print(f"\n[Step 3] 音声ダウンロードと音響イベント検出を開始...")
+        print(f"🎯 処理対象: {len(blocks_to_process)}個のスロット")
+        
+        # 実際の処理（未処理かつ音声データ存在のスロットのみ）
+        for slot in blocks_to_process:
             try:
                 print(f"📝 処理開始: {slot}")
                 
@@ -1183,28 +1315,34 @@ async def fetch_and_process(request: FetchAndProcessRequest):
                 print(f"❌ エラー: {slot} - {str(e)}")
                 errors.append(slot)
     
-    print(f"\n=== 一括取得・音響イベント検出・Supabase保存完了 ===")
-    print(f"📥 音声取得成功: {len(fetched)} ファイル")
-    print(f"📝 処理対象: {len(processed)} ファイル")
-    print(f"💾 Supabase保存成功: {len(saved_to_supabase)} ファイル")
-    print(f"⏭️ スキップ: {len(skipped)} ファイル (データなし)")
-    print(f"❌ エラー: {len(errors)} ファイル")
+    # 実行時間を計算
+    execution_time = time.time() - start_time
+    
+    print(f"\n=== 処理完了（性能改善版） ===")
+    print(f"🕐 実行時間: {round(execution_time, 1)}秒")
+    print(f"📊 処理統計:")
+    print(f"  - 総スロット数: {len(all_slots)}")
+    print(f"  - DB処理済み（スキップ）: {skipped_as_processed}")
+    print(f"  - 音声なし（スキップ）: {skipped_as_no_audio}")
+    print(f"  - 処理成功: {len(processed)}")
+    print(f"  - エラー: {len(errors)}")
+    print(f"💾 Supabase保存: {len(saved_to_supabase)}件")
     print(f"=" * 50)
     
     return {
         "status": "success",
-        "fetched": fetched,
-        "processed": processed,
-        "saved_to_supabase": saved_to_supabase,
-        "skipped": skipped,
-        "errors": errors,
+        "device_id": device_id,
+        "date": date,
         "summary": {
-            "total_time_blocks": len(all_slots),
-            "audio_fetched": len(fetched),
-            "supabase_saved": len(saved_to_supabase),
-            "skipped_no_data": len(skipped),
+            "total_slots": len(all_slots),
+            "skipped_as_processed_in_db": skipped_as_processed,
+            "skipped_as_no_audio_in_vault": skipped_as_no_audio,
+            "successfully_processed": len(processed),
             "errors": len(errors)
-        }
+        },
+        "processed_blocks": processed,
+        "error_blocks": errors,
+        "execution_time_seconds": round(execution_time, 1)
     }
 
 @app.get("/")
