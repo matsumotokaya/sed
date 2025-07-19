@@ -7,6 +7,9 @@ import glob
 import time
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import boto3
+from botocore.exceptions import ClientError
+import tempfile
 
 # 環境変数を読み込み
 load_dotenv()
@@ -47,6 +50,23 @@ if not supabase_url or not supabase_key:
 
 supabase: Client = create_client(supabase_url, supabase_key)
 print(f"Supabase接続設定完了: {supabase_url}")
+
+# AWS S3クライアントの初期化
+aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+s3_bucket_name = os.getenv('S3_BUCKET_NAME', 'watchme-vault')
+aws_region = os.getenv('AWS_REGION', 'us-east-1')
+
+if not aws_access_key_id or not aws_secret_access_key:
+    raise ValueError("AWS_ACCESS_KEY_IDおよびAWS_SECRET_ACCESS_KEYが設定されていません")
+
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    region_name=aws_region
+)
+print(f"AWS S3接続設定完了: バケット={s3_bucket_name}, リージョン={aws_region}")
 
 # FastAPIアプリケーションの初期化
 app = FastAPI(
@@ -372,6 +392,38 @@ def convert_to_new_format(device_id: str, date: str, time_block: str, timeline_e
     
     return events
 
+def extract_info_from_file_path(file_path: str) -> dict:
+    """file_pathから情報を抽出する（Whisper APIパターン）"""
+    # 例: files/d067d407-cf73-4174-a9c1-d91fb60d64d0/2025-07-19/14-30/audio.wav
+    parts = file_path.split('/')
+    if len(parts) >= 5:
+        return {
+            'device_id': parts[1],    # d067d407-cf73-4174-a9c1-d91fb60d64d0
+            'date': parts[2],         # 2025-07-19
+            'time_block': parts[3]    # 14-30
+        }
+    return None
+
+async def update_audio_files_status(file_path: str) -> bool:
+    """audio_filesテーブルのbehavior_features_statusをcompletedに更新"""
+    try:
+        update_response = supabase.table('audio_files') \
+            .update({'behavior_features_status': 'completed'}) \
+            .eq('file_path', file_path) \
+            .execute()
+        
+        if update_response.data:
+            print(f"✅ audio_filesテーブルのステータス更新成功: {file_path}")
+            return True
+        else:
+            print(f"⚠️ audio_filesテーブルのステータス更新: 対象レコードが見つかりません - {file_path}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ audio_filesテーブルのステータス更新エラー: {str(e)}")
+        print(f"   file_path: {file_path}")
+        return False
+
 async def check_existing_data_in_supabase(device_id: str, date: str) -> Set[str]:
     """
     Supabaseで既に処理済みのtime_blockを確認
@@ -680,6 +732,11 @@ class TimelineV2Request(BaseModel):
 class FetchAndProcessRequest(BaseModel):
     device_id: str
     date: str
+    threshold: float = 0.2
+
+# file_pathsベースの新しいリクエストモデル（Whisper APIパターン）
+class FetchAndProcessPathsRequest(BaseModel):
+    file_paths: List[str]  # 必須: 処理対象のfile_pathリスト
     threshold: float = 0.2
 
 class SlotTimelineData(BaseModel):
@@ -1343,6 +1400,138 @@ async def fetch_and_process(request: FetchAndProcessRequest):
         "processed_blocks": processed,
         "error_blocks": errors,
         "execution_time_seconds": round(execution_time, 1)
+    }
+
+@app.post("/fetch-and-process-paths")
+async def fetch_and_process_paths(request: FetchAndProcessPathsRequest):
+    """
+    Whisper APIパターンに合わせたfile_pathsベースの音響イベント検出エンドポイント
+    
+    指定されたfile_pathsの音声ファイルを処理し、結果をbehavior_yamnetテーブルに保存し、
+    audio_filesテーブルのbehavior_features_statusをcompletedに更新します。
+    """
+    start_time = time.time()
+    
+    print(f"\n=== file_pathsベース音響イベント検出開始 ===")
+    print(f"処理対象ファイル数: {len(request.file_paths)}")
+    print(f"閾値: {request.threshold}")
+    print(f"=" * 50)
+    
+    # file_pathsパラメータを確認
+    if not request.file_paths or len(request.file_paths) == 0:
+        execution_time = time.time() - start_time
+        return {
+            "status": "success",
+            "summary": {
+                "total_files": 0,
+                "pending_processed": 0,
+                "errors": 0
+            },
+            "processed_files": [],
+            "processed_time_blocks": [],
+            "error_files": None,
+            "execution_time_seconds": round(execution_time, 1),
+            "message": "処理対象のファイルがありません"
+        }
+    
+    # 処理対象ファイルを構築
+    files_to_process = []
+    for file_path in request.file_paths:
+        file_info = extract_info_from_file_path(file_path)
+        if file_info:
+            files_to_process.append({
+                'file_path': file_path,
+                'device_id': file_info['device_id'],
+                'date': file_info['date'],
+                'time_block': file_info['time_block']
+            })
+        else:
+            print(f"⚠️ 無効なfile_path形式: {file_path}")
+    
+    # 処理結果を記録
+    successfully_processed = []
+    error_files = []
+    
+    for audio_file in files_to_process:
+        try:
+            file_path = audio_file['file_path']
+            device_id = audio_file['device_id']
+            date = audio_file['date']
+            time_block = audio_file['time_block']
+            
+            print(f"📝 処理開始: {file_path}")
+            
+            # 一時ファイルに音声データをダウンロード
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                tmp_file_path = tmp_file.name
+                
+                try:
+                    # S3からファイルをダウンロード（file_pathをそのまま使用）
+                    s3_client.download_file(s3_bucket_name, file_path, tmp_file_path)
+                    print(f"📥 S3ダウンロード成功: {file_path}")
+                    
+                    # 音声ファイルを読み込み
+                    with open(tmp_file_path, 'rb') as f:
+                        audio_content = f.read()
+                    
+                    # 音声データを処理
+                    result = process_audio_data(audio_content, request.threshold)
+                    
+                    if result is None:
+                        print(f"❌ 音響イベント検出失敗: {file_path}")
+                        error_files.append(audio_file)
+                        continue
+                    
+                    # 新しいデータ構造に変換
+                    events = convert_to_new_format(device_id, date, time_block, result["timeline"], result["slot_timeline"])
+                    
+                    # behavior_yamnetテーブルに保存
+                    supabase_success = await save_to_supabase(device_id, date, time_block, events)
+                    if not supabase_success:
+                        print(f"❌ Supabase保存失敗: {file_path}")
+                        error_files.append(audio_file)
+                        continue
+                    
+                    # audio_filesテーブルのステータスを更新
+                    status_success = await update_audio_files_status(file_path)
+                    if not status_success:
+                        print(f"⚠️ ステータス更新失敗（処理は継続）: {file_path}")
+                    
+                    successfully_processed.append({
+                        'file_path': file_path,
+                        'time_block': time_block
+                    })
+                    print(f"✅ {file_path}: 音響イベント検出完了・Supabase保存済み・ステータス更新済み")
+                
+                finally:
+                    # 一時ファイルを削除
+                    if os.path.exists(tmp_file_path):
+                        os.unlink(tmp_file_path)
+        
+        except ClientError as e:
+            error_msg = f"{audio_file['file_path']}: S3エラー - {str(e)}"
+            print(f"❌ {error_msg}")
+            error_files.append(audio_file)
+        
+        except Exception as e:
+            print(f"❌ {audio_file['file_path']}: エラー - {str(e)}")
+            error_files.append(audio_file)
+    
+    # 処理結果を返す
+    execution_time = time.time() - start_time
+    
+    return {
+        "status": "success",
+        "summary": {
+            "total_files": len(request.file_paths),
+            "pending_processed": len(successfully_processed),
+            "errors": len(error_files)
+        },
+        "processed_files": [f['file_path'] for f in successfully_processed],
+        "processed_time_blocks": [f['time_block'] for f in successfully_processed],
+        "error_files": [f['file_path'] for f in error_files] if error_files else None,
+        "execution_time_seconds": round(execution_time, 1),
+        "message": f"{len(request.file_paths)}件中{len(successfully_processed)}件を正常に処理しました"
     }
 
 @app.get("/")
